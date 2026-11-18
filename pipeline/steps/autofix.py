@@ -35,5 +35,143 @@ from ..common import ERROR, parse_yolo_line  # noqa: F401
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    err_issues = [i for i in issues if i.severity == ERROR]
+    if not err_issues:
+        return []
+
+    fixes = []
+    removed_stems = set()
+
+    # 1. remove_image
+    remove_codes = {"DUP_IMAGE_EXACT", "DUP_IMAGE_NEAR", "LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+    for iss in err_issues:
+        if iss.code in remove_codes:
+            stem = iss.image
+            if stem not in removed_stems:
+                img_p = ds.image_path(stem)
+                if img_p and img_p.exists():
+                    img_p.unlink()
+                lbl_p = ds.label_path(stem)
+                if lbl_p.exists():
+                    lbl_p.unlink()
+                removed_stems.add(stem)
+                fixes.append({
+                    "image": stem,
+                    "line": None,
+                    "action": "remove_image",
+                    "before": img_p.name if img_p else stem,
+                    "after": "(đã xoá)"
+                })
+
+    # 2. rename_classes
+    for iss in err_issues:
+        if iss.code == "BAD_CLASS_NAME":
+            old_names = ds.yaml_names()
+            target_classes = cfg.get("classes", [])
+            data = {}
+            if ds.yaml_path.exists():
+                try:
+                    data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    data = {}
+            data["names"] = target_classes
+            ds.yaml_path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+            fixes.append({
+                "image": "data.yaml",
+                "line": None,
+                "action": "rename_classes",
+                "before": str(old_names),
+                "after": str(target_classes)
+            })
+
+    # 3. needs_label
+    for iss in err_issues:
+        if iss.code == "MISSING_LABEL_FILE":
+            if iss.image not in removed_stems:
+                fixes.append({
+                    "image": iss.image,
+                    "line": None,
+                    "action": "needs_label",
+                    "before": "(không có file)",
+                    "after": "chuyển người gán"
+                })
+
+    # 4. drop_line / clip_box
+    label_issues_by_stem = defaultdict(list)
+    line_err_codes = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX", "BOX_OUT_OF_IMAGE"}
+    for iss in err_issues:
+        if iss.code in line_err_codes and iss.line is not None and iss.image not in removed_stems:
+            label_issues_by_stem[iss.image].append(iss)
+
+    for stem, stem_issues in label_issues_by_stem.items():
+        lbl_p = ds.label_path(stem)
+        if not lbl_p.exists():
+            continue
+
+        raw_lines = lbl_p.read_text(encoding="utf-8", errors="replace").splitlines()
+        issues_per_line = defaultdict(list)
+        for iss in stem_issues:
+            issues_per_line[iss.line].append(iss)
+
+        new_lines = []
+        for line_idx, orig_line in enumerate(raw_lines, 1):
+            if line_idx not in issues_per_line:
+                new_lines.append(orig_line)
+                continue
+
+            curr_line_issues = issues_per_line[line_idx]
+            codes_on_line = {i.code for i in curr_line_issues}
+
+            drop_codes = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+            if any(c in drop_codes for c in codes_on_line):
+                fixes.append({
+                    "image": stem,
+                    "line": line_idx,
+                    "action": "drop_line",
+                    "before": orig_line,
+                    "after": "(đã xoá)"
+                })
+                continue
+
+            if "BOX_OUT_OF_IMAGE" in codes_on_line:
+                try:
+                    c, cx, cy, w, h = parse_yolo_line(orig_line)
+                    x1 = max(0.0, cx - w / 2.0)
+                    y1 = max(0.0, cy - h / 2.0)
+                    x2 = min(1.0, cx + w / 2.0)
+                    y2 = min(1.0, cy + h / 2.0)
+                    new_w = x2 - x1
+                    new_h = y2 - y1
+
+                    if new_w <= 0.0 or new_h <= 0.0:
+                        fixes.append({
+                            "image": stem,
+                            "line": line_idx,
+                            "action": "drop_line",
+                            "before": orig_line,
+                            "after": "(đã xoá)"
+                        })
+                    else:
+                        new_cx = (x1 + x2) / 2.0
+                        new_cy = (y1 + y2) / 2.0
+                        clipped_str = f"{c} {new_cx:.6g} {new_cy:.6g} {new_w:.6g} {new_h:.6g}"
+                        new_lines.append(clipped_str)
+                        fixes.append({
+                            "image": stem,
+                            "line": line_idx,
+                            "action": "clip_box",
+                            "before": orig_line,
+                            "after": clipped_str
+                        })
+                except Exception:
+                    fixes.append({
+                        "image": stem,
+                        "line": line_idx,
+                        "action": "drop_line",
+                        "before": orig_line,
+                        "after": "(đã xoá)"
+                    })
+
+        lbl_p.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+
+    return fixes
