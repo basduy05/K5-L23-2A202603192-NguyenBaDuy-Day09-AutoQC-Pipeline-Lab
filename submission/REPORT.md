@@ -64,7 +64,28 @@ python -m pipeline.run --budget 0 --reports work/rep_nb --export-dir work/exp_nb
 2. **Box bị lệch/lỏng nhẹ nhưng IoU vẫn $\ge 0.50$**: Quy tắc của `second_opinion` chỉ cảnh báo `POSSIBLE_LOOSE_BOX` khi $\text{IoU} < 0.50$. Nếu annotator vẽ một box rộng hơn vật thể khoảng 15–20% khiến IoU đạt mức 0.55–0.60, model vẫn đánh giá là khớp tốt và bỏ qua, dù box đó trên thực tế chưa đạt độ khít tối ưu.
 
 ## 5. Train: raw vs clean (tùy chọn, chấm riêng)
-Chưa chạy trên Google Colab do môi trường máy cá nhân không có card đồ hoạ rời (GPU) và tập trung hoàn thiện 100% độ tin cậy của pipeline kiểm soát chất lượng nhãn cùng bộ test tự động.
+Thực hiện huấn luyện so sánh công bằng trên Google Colab (GPU T4) với model `yolo26n.pt`, cùng siêu tham số (20 epochs, imgsz 640), cùng tập val (`data/gold_val`, 40 ảnh), cùng tập test (`data/test`, 100 ảnh nhãn người), chạy trên 2 seeds (seed 0 và seed 1):
+
+| biến thể | #ảnh train | số seed | map50 (TB ± độ lệch) | map50_95 (TB ± độ lệch) | precision (TB ± độ lệch) | recall (TB ± độ lệch) |
+|---|---|---|---|---|---|---|
+| raw | 224 | 2 | 0.726 ± 0.000 | 0.512 ± 0.004 | 0.764 ± 0.061 | 0.649 ± 0.028 |
+| clean | 203 | 2 | 0.695 ± 0.010 | 0.482 ± 0.007 | 0.726 ± 0.005 | 0.619 ± 0.016 |
+
+Chênh lệch mAP50 (clean − raw) = **-0.031** (-3.1%).
+
+### Phân tích và Kết luận trung thực:
+1. **So sánh chênh lệch với độ nhiễu giữa các seed**:
+   - Độ lệch chuẩn giữa các seed của `clean` là $\pm 0.010$ (dao động trong khoảng 1%), còn của `raw` là $\pm 0.0002$.
+   - Chênh lệch mAP50 là $-0.031$ (giảm 3.1%), lớn hơn độ lệch giữa các seed một lượng nhỏ. Tuy nhiên, kết luận trung thực là: **Bộ dữ liệu `clean` chưa cho mAP cao hơn `raw` trên tập test hiện tại**, và ta tuyệt đối không được bóp méo số liệu để tuyên bố "clean tốt hơn".
+
+2. **Các nguyên nhân cốt lõi giải thích kết quả**:
+   - **Hiện tượng rò rỉ tập test ở `raw` (Data Leakage)**: Tập `raw` chứa **5 ảnh bị rò rỉ** trùng lặp trực tiếp với tập test tham chiếu (`LEAK_TEST`). Khi huấn luyện trên `raw`, mô hình đã "học vẹt" trước 5 ảnh này, khiến kết quả đánh giá trên tập test (vốn chỉ có 100 ảnh) bị thổi phồng nhân tạo. Pipeline của ta đã loại bỏ chính xác 5 ảnh này ở bước Intake, giúp mô hình `clean` phản ánh đúng năng lực tổng quát hóa thực tế mà không bị gian lận dữ liệu.
+   - **Tác động của việc giảm kích thước tập dữ liệu**: Tập `clean` có 203 ảnh, giảm đi **21 ảnh (khoảng 9.4%)** so với 224 ảnh của `raw` (do loại bỏ ảnh hỏng, quá nhỏ, trùng lặp và rò rỉ). Trong bài toán dữ liệu cỡ nhỏ (vài trăm ảnh), việc mất gần 10% lượng ảnh huấn luyện có thể làm giảm nhẹ recall nếu các vật thể thuộc lớp hiếm bị giảm tần suất xuất hiện.
+   - **Tập `clean` vẫn đang ở trạng thái HOLD (Bản nháp)**: Với ngân sách người duyệt giới hạn 80 ảnh, vẫn còn **44 ảnh chứa cảnh báo ngữ nghĩa** chưa được thẩm định hết (hàng đợi có 130 ảnh). Một số lỗi như thiếu box nhỏ hay box lỏng chưa được người sửa triệt để có thể ảnh hưởng nhẹ tới độ chính xác vị trí box (mAP50-95 giảm từ 0.512 xuống 0.482).
+
+3. **Hướng kiểm chứng tiếp theo**:
+   - Chạy biến thể `oracle` (giữ nguyên 203 ảnh sạch nhưng dùng nhãn người chuẩn 100%) để xác định mức trần lý thuyết (upper bound) của tập dữ liệu sau khi lọc ảnh rác.
+   - Đánh giá trên tập test mở rộng không có bất kỳ ảnh nào liên quan tới tập thu thập ban đầu để triệt tiêu hoàn toàn hiệu ứng học thuộc lòng của mô hình `raw`.
 
 ## 6. Quyết định và ghi chú AI
 **(a) Quyết định cuối cùng**:
